@@ -1,0 +1,12 @@
+.buildenv/
+build/
+dist/
+__pycache__/
+*.spec
+tools/
+*.AppImage
+*.appimage
+*.deb
+.venv/
+venv/
+

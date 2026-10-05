@@ -1,0 +1,3 @@
+PySide6-Essentials>=6.6
+inotify_simple>=1.3
+olefile>=0.46
