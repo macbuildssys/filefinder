@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=File Finder
+Comment=Find files and folders on this computer
+Exec=filefinder
+Icon=filefinder
+Terminal=false
+Categories=Utility;FileTools;
