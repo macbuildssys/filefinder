@@ -29,6 +29,20 @@ HOME_BOOST = 2.0         # your own files rank above system files with an equal 
 CONTENT_LOOKUPS = 40     # how many results get the (slower) 'which words matched in the text' check
 SQL_RANK = "bm25(docs, 10.0, 3.0, 1.0, 3.0)"   # name 10x, folder 3x, text 1x, photo details 3x
 
+# The type dropdown in the window: label, file types (kinds) and exact file endings.
+# Documents also covers PDFs, spreadsheets and presentations. Code also covers JSON.
+FILE_TYPE_CHOICES = {
+    "All types": ([], []),
+    "Documents": (["document", "pdf", "spreadsheet", "presentation"], []),
+    "Images": (["image"], []),
+    "Videos": (["video"], []),
+    "Audio": (["audio"], []),
+    "Archives": (["archive"], []),
+    "Code": (["code"], []),
+    "JSON": ([], ["json"]),
+    "Folders": (["folder"], []),
+}
+
 @dataclass
 class Hit:
     id: int
@@ -42,6 +56,7 @@ class Hit:
     taken: float | None = None     # date a photo was taken
     score: float = 0.0
     reason: str = ""
+    strong: bool = False           # the file's own name has every word you typed
 
 @dataclass
 class SearchResult:
@@ -52,6 +67,7 @@ class SearchResult:
     suggestions: list = field(default_factory=list)
     elapsed: float = 0.0
     error: str = ""
+    hidden: int = 0                # weaker matches left out because stronger ones exist
 
 @dataclass
 class Group:
@@ -70,8 +86,13 @@ def _hit(row) -> Hit:
     return Hit(id_, path, name, folder, kind, type_label(kind, ext), size, mtime, taken)
 
 def is_known(conn, word: str) -> bool:
-    return word.isdigit() or conn.execute(
-        "SELECT 1 FROM vocab WHERE word = ?", (word,)).fetchone() is not None
+    """True when the word is a real word in your files, or the start of one ("happ" for
+    "happiful"). Only a word that is neither gets spelling suggestions."""
+    if word.isdigit():
+        return True
+    upper = word[:-1] + chr(ord(word[-1]) + 1)       # every word starting with it sorts below this
+    return conn.execute("SELECT 1 FROM vocab WHERE word >= ? AND word < ? LIMIT 1",
+                        (word, upper)).fetchone() is not None
 
 def fuzzy_words(conn, term: str, limit: int = 4) -> list[str]:
     """Words in your file names that are one or two typos away from term.
@@ -107,7 +128,9 @@ def build_groups(conn, terms, fuzzy_for_all: bool) -> list[Group]:
     groups = []
     for t in terms:
         known = is_known(conn, t)
-        fuzzy = fuzzy_words(conn, t) if (fuzzy_for_all or not known) else []
+        # Spelling suggestions for words that are not in your files. A word that is there is
+        # only widened this way when it is long: short ones ("happ" and "app") are too alike.
+        fuzzy = fuzzy_words(conn, t) if (not known or (fuzzy_for_all and len(t) >= 6)) else []
         groups.append(Group(t, known, fuzzy, related_words(conn, t)))
     return groups
 
@@ -122,7 +145,7 @@ def _group_expr(g: Group) -> str:
 def _filters(q: ParsedQuery, folders: list[str], scope=None):
     """SQL conditions for the filters in the query. scope limits results to some folders."""
     sql, params = [], []
-    if scope:
+    if scope is not None:     # an empty list means no folders at all, so nothing qualifies
         inside, scope_params = path_ranges("f.path", scope)
         if inside:
             sql.append(inside)
@@ -130,6 +153,9 @@ def _filters(q: ParsedQuery, folders: list[str], scope=None):
     if q.kinds:
         sql.append("f.kind IN (%s)" % ",".join("?" * len(q.kinds)))
         params += q.kinds
+    if q.exts:
+        sql.append("f.ext IN (%s)" % ",".join("?" * len(q.exts)))
+        params += q.exts
     if q.min_size is not None:
         sql.append("f.size >= ?")
         params.append(q.min_size)
@@ -157,8 +183,10 @@ def _folder_names_that_exist(conn, words):
         (real if row else leftover).append(w)
     return real, leftover
 
-def _fts_rows(conn, groups, joiner, where, params, limit):
+def _fts_rows(conn, groups, joiner, where, params, limit, name_only=False):
     expr = f" {joiner} ".join(_group_expr(g) for g in groups)
+    if name_only:
+        expr = f"name : ({expr})"      # only the item's own name, not the folders it sits in
     sql = (f"SELECT {FILE_COLUMNS}, docs.name, docs.folder, docs.extra, {SQL_RANK} AS raw_score "
            "FROM docs JOIN files f ON f.id = docs.rowid "
            f"WHERE docs MATCH ?{where} ORDER BY raw_score LIMIT ?")
@@ -225,8 +253,34 @@ def _explain(g: Group, name_words, folder_words, extra_words, content_words):
             return f'text inside the file has "{w}", which goes with "{t}"', 0.55
     return None
 
-def _score(conn, rows, groups, expr, terms, now, all_words_matched) -> list[Hit]:
+def _own_name_matches(groups, name_words) -> bool:
+    """True when every typed word is a whole word, or the start of one, in the name itself."""
+    for g in groups:
+        t = g.term
+        if t not in name_words and not (len(t) >= 2 and any(w.startswith(t) for w in name_words)):
+            return False
+    return bool(groups)
+
+def _narrow(hits, include_weak: bool, folders_only: bool):
+    """With strong matches (every word in the name), show only those, and say how many
+    weaker ones are held back. A folder is dropped when a file inside it is also shown,
+    since that file's row already says which folder it is in."""
+    strong = [h for h in hits if h.strong]
+    hidden = 0
+    if strong and len(strong) < len(hits) and not include_weak:
+        hidden = len(hits) - len(strong)
+        hits = strong
+    if not folders_only:
+        file_paths = [h.path for h in hits if h.kind != "folder"]
+        hits = [h for h in hits if h.kind != "folder"
+                or not any(p.startswith(h.path + "/") for p in file_paths)]
+    return hits, hidden
+
+def _score(conn, rows, groups, expr, terms, now, all_words_matched, include_weak=False) -> list[Hit]:
     clicks = _click_weights(conn, terms, now)
+    # Weaker matches stay hidden when a strong one exists, so explaining them is wasted work.
+    skip_text = not include_weak and any(
+        _own_name_matches(groups, set(r[N_FILE].split())) for r in rows)
 
     # First explain what we can from the file and folder names (free).
     prepared, need_text = [], []
@@ -235,7 +289,7 @@ def _score(conn, rows, groups, expr, terms, now, all_words_matched) -> list[Hit]
         name_words, folder_words = set(name_list), set(row[N_FILE + 1].split())
         extra_words = set(row[N_FILE + 2].split())
         explained = [_explain(g, name_words, folder_words, extra_words, ()) for g in groups]
-        if None in explained and len(need_text) < CONTENT_LOOKUPS:
+        if None in explained and not skip_text and len(need_text) < CONTENT_LOOKUPS:
             need_text.append(row[0])
         prepared.append((row, name_list, name_words, folder_words, extra_words, explained))
 
@@ -245,6 +299,7 @@ def _score(conn, rows, groups, expr, terms, now, all_words_matched) -> list[Hit]
     hits = []
     for row, name_list, name_words, folder_words, extra_words, explained in prepared:
         hit = _hit(row)
+        hit.strong = _own_name_matches(groups, name_words)
         reasons, qualities = [], []
         for g, found in zip(groups, explained):
             if found is None and hit.id in content:
@@ -293,31 +348,41 @@ def _corrected_text(text: str, groups) -> str:
     return new if new != text else ""
 
 def run_search(conn, text: str, limit: int = 300, now: float | None = None,
-               scope: list | None = None) -> SearchResult:
-    """Search. scope is an optional list of folders: only files inside them are returned."""
+               scope: list | None = None, file_type: str | None = None,
+               include_weak: bool = False) -> SearchResult:
+    """Search. scope is an optional list of folders: only files inside them are returned.
+    file_type is a label from FILE_TYPE_CHOICES. A type typed in the search box wins over it."""
     now = now or time.time()
     started = time.perf_counter()
     q = parse_query(text, now)
+    kinds, exts = FILE_TYPE_CHOICES.get(file_type or "All types", ([], []))
+    if (kinds or exts) and not q.kinds:
+        q.kinds, q.exts = list(kinds), list(exts)
+        q.notes.insert(0, f"type: {file_type}")
     folders, leftover = _folder_names_that_exist(conn, q.folder_words)
     terms = (q.terms + [w for w in leftover if w not in q.terms])[:MAX_TERMS]
     result = SearchResult(terms=terms, notes=q.notes + [f"in folder {w}" for w in folders])
     where, params = _filters(q, folders, scope)
+    name_only = q.kinds == ["folder"]      # a folder search is about folder names alone
 
     if not terms:
         if q.has_filters():
             result.hits = _filter_only(conn, q, folders, limit, scope)
     else:
         groups = build_groups(conn, terms, fuzzy_for_all=False)
-        rows, expr = _fts_rows(conn, groups, "AND", where, params, limit * 3)
-        hits = _score(conn, rows, groups, expr, terms, now, True) if rows else []
+        rows, expr = _fts_rows(conn, groups, "AND", where, params, limit * 3, name_only)
+        hits = _score(conn, rows, groups, expr, terms, now, True, include_weak) if rows else []
         if len(hits) < FEW_RESULTS:
             # Too little found: allow typos on every word and partial matches.
             groups = build_groups(conn, terms, fuzzy_for_all=True)
-            rows, expr = _fts_rows(conn, groups, "OR", where, params, limit * 3)
-            hits = _score(conn, rows, groups, expr, terms, now, len(terms) == 1) if rows else []
+            rows, expr = _fts_rows(conn, groups, "OR", where, params, limit * 3, name_only)
+            hits = (_score(conn, rows, groups, expr, terms, now, len(terms) == 1, include_weak)
+                    if rows else [])
             if len(hits) < FEW_RESULTS:
                 result.did_you_mean = _corrected_text(text, groups)
-        result.hits = hits[:limit]
+        result.hits, result.hidden = _narrow(hits[:limit], include_weak, q.kinds == ["folder"])
+        if result.hidden:
+            result.notes.append("showing names that have all your words")
 
     result.suggestions = suggest(conn, text, result.did_you_mean)
     result.elapsed = time.perf_counter() - started

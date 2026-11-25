@@ -23,6 +23,11 @@ DEFAULT_EXCLUDE_NAMES = ["node_modules", "__pycache__", "site-packages", "venv",
 ALWAYS_SKIP = ["/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/snapd", "/var/lib/docker",
                "/var/cache", "/var/lib/flatpak/repo"]
 
+# Folders that belong to the operating system, not to you. In whole computer mode they are
+# skipped unless "include operating system folders" is ticked in Settings.
+OS_FOLDERS = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/boot",
+              "/var", "/opt", "/tmp", "/lost+found"]
+
 def is_under(path: str, root: str) -> bool:
     """True when path is root itself or lives inside it."""
     return root == "/" or path == root or path.startswith(root + "/")
@@ -34,6 +39,7 @@ def default_deep_folders() -> list:
 @dataclass
 class Config:
     whole_system: bool = True                     # search the whole computer
+    include_os_folders: bool = False              # also index /usr, /etc, /var and other OS folders
     include: list = field(default_factory=list)   # folders to index when whole_system is off
     deep_folders: list = field(default_factory=default_deep_folders)   # read inside files + watch live
     exclude: list = field(default_factory=list)   # folders to skip (with everything inside)

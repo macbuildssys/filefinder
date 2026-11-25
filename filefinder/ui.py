@@ -5,24 +5,37 @@ import os
 import shutil
 import subprocess
 import threading
-import time
 from datetime import datetime
 
 from PySide6.QtCore import (QAbstractTableModel, QFile, QMimeDatabase, QModelIndex, QObject,
-                            QRunnable, QStringListModel, Qt, QThreadPool, QTimer, Signal)
+                            QRunnable, QSize, QStringListModel, Qt, QThreadPool, QTimer, Signal)
 from PySide6.QtGui import QAction, QGuiApplication, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QCompleter, QDialog,
                                QDialogButtonBox, QFileDialog, QGroupBox, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow,
-                               QListWidgetItem, QMenu, QMessageBox, QPushButton, QTableView,
-                               QVBoxLayout, QWidget)
+                               QListWidgetItem, QMenu, QMessageBox, QPushButton, QStackedWidget,
+                               QTableView, QVBoxLayout, QWidget)
 
 from .config import Config, save_config
 from .db import connect
 from .fileops import move_path
 from .indexer import Indexer
 from .openwith import apps_for_mime, clean_env, launch, load_apps, open_default, system_default_id
-from .search import SearchResult, nearby, run_search
+from .search import FILE_TYPE_CHOICES, SearchResult, nearby, run_search
+
+# Icon names from the system icon theme, one per kind of file.
+KIND_ICONS = {"folder": "folder", "pdf": "application-pdf", "image": "image-x-generic",
+              "video": "video-x-generic", "audio": "audio-x-generic",
+              "document": "x-office-document", "spreadsheet": "x-office-spreadsheet",
+              "presentation": "x-office-presentation", "archive": "package-x-generic",
+              "code": "text-x-script"}
+_icon_cache: dict = {}
+
+def kind_icon(kind: str) -> QIcon:
+    if kind not in _icon_cache:
+        _icon_cache[kind] = QIcon.fromTheme(KIND_ICONS.get(kind, "text-x-generic"),
+                                            QIcon.fromTheme("text-x-generic"))
+    return _icon_cache[kind]
 
 COLUMNS = ["Name", "Path", "Folder", "Type", "Size", "Modified", "Taken", "Why it matched"]
 COLUMN_WIDTHS = [240, 380, 260, 110, 80, 130, 130, 380]
@@ -79,18 +92,23 @@ class SearchSignals(QObject):
 
 
 class SearchTask(QRunnable):
-    def __init__(self, seq, mode, text, db_path, signals, scope=None):
+    def __init__(self, seq, mode, text, db_path, signals, scope=None, file_type=None,
+                 include_weak=False, is_current=None):
         super().__init__()
         self.seq, self.mode, self.text = seq, mode, text
         self.db_path, self.signals, self.scope = db_path, signals, scope
+        self.file_type, self.include_weak, self.is_current = file_type, include_weak, is_current
 
     def run(self):
+        if self.is_current and not self.is_current():
+            return                        # typed on since: this search is already out of date
         try:
             conn = _thread_connection(self.db_path)
             if self.mode == "nearby":
                 result = nearby(conn, self.text)
             else:
-                result = run_search(conn, self.text, scope=self.scope)
+                result = run_search(conn, self.text, scope=self.scope, file_type=self.file_type,
+                                    include_weak=self.include_weak)
         except Exception as exc:
             result = SearchResult(error=str(exc))
         self.signals.done.emit(self.seq, result)
@@ -143,6 +161,8 @@ class ResultsModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             return (h.name, h.path, h.folder, h.label, format_size(h), format_time(h.mtime),
                     format_time(h.taken) if h.taken else "", h.reason)[col]
+        if role == Qt.DecorationRole and col == 0:
+            return kind_icon(h.kind)
         if role == Qt.ToolTipRole:
             return h.reason if col == 7 else h.path
         if role == Qt.TextAlignmentRole and col == 4:
@@ -278,12 +298,16 @@ class SettingsDialog(QDialog):
                            "folder and nothing is sent anywhere.")
             hello.setWordWrap(True)
             layout.addWidget(hello)
-        self.whole = QCheckBox("Search the whole computer (every file and folder you are allowed to see)")
+        self.whole = QCheckBox("Also search other places on this computer (outside your home "
+                               "folder and external drives)")
         self.whole.setChecked(cfg.whole_system)
         layout.addWidget(self.whole)
-        note = QLabel("Every file is found by name. Your home folder and external drives are also "
-                      "read inside and kept up to date live. System folders are refreshed every "
-                      "15 minutes. Places like /proc and network drives are always skipped.")
+        self.os_folders = QCheckBox("Include operating system folders (/usr, /etc, /var and similar)")
+        self.os_folders.setChecked(cfg.include_os_folders)
+        layout.addWidget(self.os_folders)
+        note = QLabel("Your home folder and external drives are read inside and kept up to date "
+                      "live. Other places are found by name only and refreshed every 15 minutes. "
+                      "Places like /proc and network drives are always skipped.")
         note.setWordWrap(True)
         note.setStyleSheet("color: palette(mid);")
         layout.addWidget(note)
@@ -320,6 +344,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     def _update_enabled(self, *_):
+        self.os_folders.setEnabled(self.whole.isChecked())
         self.deep_group.setEnabled(self.whole.isChecked())
         self.include_group.setEnabled(not self.whole.isChecked())
 
@@ -353,7 +378,8 @@ class SettingsDialog(QDialog):
     def result_config(self) -> Config:
         def items(w):
             return [w.item(i).text() for i in range(w.count())]
-        return Config(whole_system=self.whole.isChecked(), include=items(self.include),
+        return Config(whole_system=self.whole.isChecked(),
+                      include_os_folders=self.os_folders.isChecked(), include=items(self.include),
                       deep_folders=items(self.deep), exclude=items(self.exclude),
                       exclude_names=self.names, skip_hidden=self.hidden.isChecked(),
                       index_text=self.text.isChecked(), index_photos=self.photos.isChecked(),
@@ -396,21 +422,34 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         layout = QVBoxLayout(central)
+        layout.setContentsMargins(16, 14, 16, 8)
+        layout.setSpacing(10)
         self.box = SearchBox()
         self.box.setPlaceholderText('Search files and folders, for example "invoice", '
                                     '"tax 2025", "PDFs in Downloads", "large videos last month"')
         self.box.setClearButtonEnabled(True)
-        self.box.textChanged.connect(lambda: self.timer.start(120))
+        self.show_weak = False
+        self.box.textChanged.connect(self._typed)
         self.box.returnPressed.connect(self._focus_results)
         self.box.down_pressed.connect(self._focus_results)
         top = QHBoxLayout()
+        top.setSpacing(8)
         top.addWidget(self.box, 1)
+        self.type_box = QComboBox()
+        self.type_box.addItems(list(FILE_TYPE_CHOICES))
+        self.type_box.setToolTip("Only show one kind of file. A type you write in the search "
+                                 'box, such as "pdfs", is used instead.')
+        self.type_box.currentIndexChanged.connect(lambda _: self._start_search())
+        self.type_box.setMaxVisibleItems(15)
+        top.addWidget(self.type_box)
         self.scope_box = QComboBox()
-        self.scope_box.addItems(["System-wide", "My folders only"])
-        self.scope_box.setToolTip("System-wide includes system folders. My folders only limits "
-                                  "results to your home folder and external drives.")
+        self.scope_box.addItems(["My folders only", "System-wide"])
+        self.scope_box.setToolTip("My folders only shows results from your home folder and "
+                                  "external drives. System-wide also shows other places "
+                                  "outside them.")
         self.scope_box.currentIndexChanged.connect(lambda _: self._start_search())
         self.scope_box.setVisible(self.cfg.whole_system)
+        self.scope_box.setMaxVisibleItems(15)
         top.addWidget(self.scope_box)
         layout.addLayout(top)
 
@@ -432,7 +471,12 @@ class MainWindow(QMainWindow):
         self.dym.setFlat(True)
         self.dym.setVisible(False)
         self.dym.clicked.connect(lambda: self.box.setText(self.dym.property("fix")))
+        self.more = QPushButton("")
+        self.more.setFlat(True)
+        self.more.setVisible(False)
+        self.more.clicked.connect(self._show_more)
         info.addWidget(self.notes, 1)
+        info.addWidget(self.more)
         info.addWidget(self.dym)
         layout.addLayout(info)
 
@@ -442,7 +486,11 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
+        self.table.setAlternatingRowColors(False)
+        self.table.setShowGrid(True)
+        self.table.setIconSize(QSize(20, 20))
+        self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.setWordWrap(False)
         self.table.setTextElideMode(Qt.ElideMiddle)
         self.table.setSortingEnabled(True)
@@ -454,11 +502,18 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.doubleClicked.connect(lambda _: self.open_selected())
         self.table.selectionModel().currentRowChanged.connect(self._show_selected_path)
-        layout.addWidget(self.table, 1)
+        self.empty_label = QLabel("No results found")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setStyleSheet("color: palette(mid); font-size: 16pt;")
+        self.pages = QStackedWidget()          # page 0 is the table, page 1 says nothing was found
+        self.pages.addWidget(self.table)
+        self.pages.addWidget(self.empty_label)
+        layout.addWidget(self.pages, 1)
 
         self.path_label = QLabel("")
         self.path_label.setTextFormat(Qt.PlainText)
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.path_label.setStyleSheet("color: palette(mid); padding: 0 4px;")
         layout.addWidget(self.path_label)
         self.setCentralWidget(central)
 
@@ -513,17 +568,31 @@ class MainWindow(QMainWindow):
         self.seq += 1
         if not text:
             self.model.set_hits([])
+            self._show_selected_path()
+            self.pages.setCurrentIndex(0)
             self.notes.setText("")
             self.dym.setVisible(False)
             self.statusBar().clearMessage()
             return
         scope = self._scope_roots() if mode == "text" else None
+        file_type = self.type_box.currentText() if mode == "text" else None
+        self.indexer.note_search()
+        current = self.seq
         QThreadPool.globalInstance().start(
-            SearchTask(self.seq, mode, text, self.db_path, self.signals, scope))
+            SearchTask(self.seq, mode, text, self.db_path, self.signals, scope, file_type,
+                       self.show_weak, lambda: current == self.seq))
+
+    def _typed(self):
+        self.show_weak = False            # a new search starts with the strong matches only
+        self.timer.start(120)
+
+    def _show_more(self):
+        self.show_weak = True
+        self._start_search()
 
     def _scope_roots(self):
-        """Folders to limit the search to, or None to search system-wide."""
-        if self.cfg.whole_system and self.scope_box.currentIndex() == 1:
+        """Folders to limit the search to, or None to search the whole computer."""
+        if self.cfg.whole_system and self.scope_box.currentIndex() == 0:
             return [os.path.abspath(os.path.expanduser(p)) for p in self.cfg.deep_folders]
         return None
 
@@ -535,21 +604,30 @@ class MainWindow(QMainWindow):
             return
         self.table.horizontalHeader().setSortIndicator(-1, Qt.AscendingOrder)
         self.model.set_hits(result.hits)
+        self.pages.setCurrentIndex(0 if result.hits else 1)
         if result.hits:
             self.table.selectRow(0)
+        self._show_selected_path()             # clears the path line when nothing is selected
         parts = (["words: " + ", ".join(result.terms)] if result.terms else []) + result.notes
         self.notes.setText("Looking for: " + "; ".join(parts) if parts else "")
         if result.did_you_mean:
-            self.dym.setText(f"Did you mean: {result.did_you_mean}?")
+            text = f"Did you mean: {result.did_you_mean}?"
+            self.dym.setText(text)
+            self.dym.setMinimumWidth(self.dym.fontMetrics().horizontalAdvance(text) + 48)   # never cut off
             self.dym.setProperty("fix", result.did_you_mean)
             self.dym.setVisible(True)
         else:
             self.dym.setVisible(False)
+        if result.hidden:
+            label = f"Show {result.hidden} more matches"
+            self.more.setText(label)
+            self.more.setMinimumWidth(self.more.fontMetrics().horizontalAdvance(label) + 48)
+        self.more.setVisible(bool(result.hidden))
         self.completer_model.setStringList(result.suggestions)
         if result.suggestions and self.box.hasFocus():
             self.completer.complete()
         shown = f"{len(result.hits):,} results in {result.elapsed * 1000:.0f} ms"
-        self.statusBar().showMessage(shown if result.hits else "No matches. " + shown)
+        self.statusBar().showMessage(shown if result.hits else "No results found")
 
     def _on_index_status(self, message: str):
         self.index_label.setText(message)

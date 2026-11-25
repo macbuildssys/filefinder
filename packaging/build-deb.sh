@@ -28,7 +28,7 @@ Maintainer: Dev <dev@localhost>
 Installed-Size: $size
 Section: utils
 Priority: optional
-Depends: libc6, libegl1, libgl1, libxkbcommon-x11-0, libxcb-cursor0
+Depends: libc6, libegl1, libgl1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libfontconfig1, libfreetype6, libdbus-1-3, libglib2.0-0
 Recommends: poppler-utils
 Description: Find files and folders on this computer
  Searches by name, folder and the text inside your own files. Forgives typos
