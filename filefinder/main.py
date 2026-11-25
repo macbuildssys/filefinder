@@ -12,10 +12,12 @@ def main() -> int:
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QDialog
 
+    from . import theme
     from .ui import MainWindow, SettingsDialog
 
     app = QApplication(sys.argv)
     app.setApplicationName("File Finder")
+    theme.apply(app)
     app.setDesktopFileName("filefinder")
     app.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "data", "filefinder.png")))
 

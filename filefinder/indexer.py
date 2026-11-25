@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime
 
-from .config import ALWAYS_SKIP, DB_PATH, HOME, Config, is_under
+from .config import ALWAYS_SKIP, DB_PATH, HOME, OS_FOLDERS, Config, is_under
 from .db import connect, get_meta, path_ranges, reset_index, set_meta
 from .exif import read_photo_info
 from .extract import PHOTO_EXTENSIONS, kind_of, read_text, split_ext, text_extensions
@@ -56,16 +56,24 @@ class Indexer:
         self.dirty = 0                    # changes since related words were last learned
         self.last_learn = 0.0
         self.last_scan = 0.0
+        self.last_search = 0.0            # when the window last searched
         self._prepare()
 
     def _prepare(self) -> None:
         """Work out, once per scan, which places to skip and which to read inside."""
         self.skip_mounts = skipped_mount_points() if self.cfg.whole_system else set()
-        skips = list(self.cfg.exclude) + (ALWAYS_SKIP if self.cfg.whole_system else [])
-        self._skip_paths = {os.path.abspath(os.path.expanduser(p)) for p in skips}
-        self._skip_prefixes = tuple(p + "/" for p in self._skip_paths)
         self.deep_roots = self._clean_roots(self.cfg.deep_folders if self.cfg.whole_system
                                             else self.cfg.include)
+        skips = list(self.cfg.exclude) + [os.path.join(HOME, "snap")]   # ~/snap is app data
+        if self.cfg.whole_system:
+            skips += ALWAYS_SKIP
+            if not self.cfg.include_os_folders:
+                # Never skip a folder that holds your home or one of your chosen folders
+                # (for example when the home folder is /var/lib/me or you run as root).
+                places = [HOME] + self.deep_roots
+                skips += [f for f in OS_FOLDERS if not any(is_under(p, f) for p in places)]
+        self._skip_paths = {os.path.abspath(os.path.expanduser(p)) for p in skips}
+        self._skip_prefixes = tuple(p + "/" for p in self._skip_paths)
 
     @staticmethod
     def _clean_roots(paths) -> list[str]:
@@ -98,6 +106,17 @@ class Indexer:
             self.watcher.close()
         if self.thread:
             self.thread.join(timeout=5)
+
+    def note_search(self) -> None:
+        """Called by the window on every search, so background work can step aside."""
+        self.last_search = time.time()
+
+    def _make_way(self) -> None:
+        """Pause for a moment while someone is searching, so results stay quick."""
+        waited = 0.0
+        while time.time() - self.last_search < 0.7 and waited < 3.0 and not self.stop_event.is_set():
+            time.sleep(0.05)
+            waited += 0.05
 
     def submit(self, event: tuple) -> None:
         self.events.put(event)
@@ -256,6 +275,8 @@ class Indexer:
         if is_dir:
             stack.append(path)
         self.visited += 1
+        if self.visited % 500 == 0:
+            self._make_way()
         if self.visited % 5000 == 0:
             self.status(f"Scanning folders: {self.visited:,} items")
         size = 0 if is_dir else info.st_size
@@ -340,6 +361,8 @@ class Indexer:
         for i, (id_, path, ext, size, mtime) in enumerate(rows, 1):
             if self.stop_event.is_set():
                 break
+            if i % 25 == 0:
+                self._make_way()
             self._store_details(conn, id_, path, ext, size, mtime)
             if i % 300 == 0:
                 conn.commit()
@@ -375,7 +398,7 @@ class Indexer:
 
     def _learn(self, conn) -> None:
         self.status("Learning which words go together in your files")
-        learn_related(conn)
+        learn_related(conn, pause=self._make_way)
         self.dirty = 0
         self.last_learn = time.time()
         set_meta(conn, "related_built", str(self.last_learn))

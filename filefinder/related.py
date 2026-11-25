@@ -37,8 +37,10 @@ def _doc_words(name: str, folder: str, content: str) -> list[str]:
     return result[:60]
 
 def learn_related(conn, max_docs: int = 30000, per_doc: int = 15, min_df: int = 3,
-                  min_together: int = 3, max_df_ratio: float = 0.2, top_k: int = 8) -> int:
+                  min_together: int = 3, max_df_ratio: float = 0.2, top_k: int = 8,
+                  pause=None) -> int:
     """Fill the related table. Returns the number of word pairs stored.
+    pause is called now and then so a search in progress can go first.
 
     Looks at a sample of at most max_docs files so it stays quick and light on
     memory even with hundreds of thousands of files.
@@ -50,7 +52,9 @@ def learn_related(conn, max_docs: int = 30000, per_doc: int = 15, min_df: int = 
         "WHERE f.id % ? = 0", (step,))
 
     documents, doc_freq = [], Counter()
-    for name, folder, content in rows:
+    for count, (name, folder, content) in enumerate(rows, 1):
+        if pause and count % 150 == 0:
+            pause()
         words = _doc_words(name, folder, content)
         if len(words) >= 2:
             documents.append(words)
@@ -67,7 +71,9 @@ def learn_related(conn, max_docs: int = 30000, per_doc: int = 15, min_df: int = 
     usable = {w for w, c in doc_freq.items() if min_df <= c <= max_df}
 
     together = Counter()
-    for words in documents:
+    for count, words in enumerate(documents, 1):
+        if pause and count % 300 == 0:
+            pause()
         # Keep the most specific (rarest) words of each file to bound the work.
         keep = sorted((w for w in words if w in usable), key=lambda w: (doc_freq[w], w))
         together.update(combinations(sorted(keep[:per_doc]), 2))

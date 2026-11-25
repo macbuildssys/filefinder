@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -45,6 +44,7 @@ STOP_WORDS = {
 class ParsedQuery:
     terms: list = field(default_factory=list)         # words to look for
     kinds: list = field(default_factory=list)         # file types, for example pdf
+    exts: list = field(default_factory=list)          # exact file endings, for example json
     min_size: int | None = None
     max_size: int | None = None
     after: float | None = None                        # dated on or after
@@ -53,7 +53,7 @@ class ParsedQuery:
     notes: list = field(default_factory=list)         # plain language summary
 
     def has_filters(self) -> bool:
-        return bool(self.kinds or self.folder_words or self.min_size is not None
+        return bool(self.kinds or self.exts or self.folder_words or self.min_size is not None
                     or self.max_size is not None or self.after is not None
                     or self.before is not None)
 

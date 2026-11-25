@@ -35,6 +35,23 @@ File Finder does not use a neural network or chatbot technology. Instead, it use
 
 For those who are interested, the ranking uses a standard search formula called BM25 and the spelling checker uses edit distance. Both are well-known methods that do not require training data.
 
+## Where it searches
+
+There is a dropdown next to the search box with two choices.
+
+* **My folders only** (the default) searches your home folder and your external drives, such as USB sticks and extra disks.
+* **System-wide** searches those too, and also other places on the computer that are outside your home folder, such as a second disk mounted somewhere else.
+
+Think of your home folder as your own house. System-wide also looks in the shared spaces of the building. If all your files live in your home folder, the two choices will show the same results, and that is normal.
+
+The folders that belong to the operating system, such as `/usr`, `/etc` and `/var`, are left out of both choices so they do not fill your results. If you do want them, open Settings, tick "Include operating system folders", and then choose System-wide. Places like `/proc` and network drives are always skipped.
+
+Next to it is a second dropdown to show only one kind of file: documents (this includes PDFs, spreadsheets and presentations), images, videos, audio, archives, code, JSON or folders. A folder search matches the folder's own name only, not the files inside it.
+
+## Looks the same everywhere
+
+File Finder always uses its own light colours, so it looks the same on every computer, even when your system is set to dark mode. There is no light or dark setting to change.
+
 ## Install
 
 You can use either the .deb or the AppImage. Download one of them from the Releases page. It runs on 64 bit Linux, Ubuntu 24.04 or newer.
@@ -42,7 +59,7 @@ You can use either the .deb or the AppImage. Download one of them from the Relea
 ### Option 1: the .deb (adds a menu entry)
 
 ```
-sudo apt install ./filefinder_0.0.1_amd64.deb
+sudo apt install ./filefinder_0.0.2_amd64.deb
 ```
 
 Then open File Finder from your application menu, or type `filefinder` in a terminal.
